@@ -1,241 +1,157 @@
 /**
- * clawworker — CF Worker
+ * clawworker — CF Worker (GCP proxy mode)
  *
- * Acts as an authenticated HTTP/WebSocket proxy between the internet and the
- * OpenClaw container. Key responsibilities:
+ * Free-tier compatible. Proxies HTTP + WebSocket to a GCP VM running OpenClaw.
+ * No Container binding, no R2 — just fetch() to the backend.
  *
- *   1. Auth — validate Bearer token on protected routes
- *   2. Proxy — forward /api/* requests to the container on port 18789
- *   3. WebSocket — relay /ws upgrades to the container
- *   4. R2 backup — cron triggers workspace tar → R2 every 5 minutes
- *   5. Health — /health endpoint (no auth required)
+ * Architecture:
+ *   Internet → CF Worker (auth + routing) → GCP VM (nginx + PM2 agents)
  *
- * Cloudflare Containers (beta) docs:
- *   https://developers.cloudflare.com/containers/
+ * Env vars (set via wrangler secret put or wrangler.toml [vars]):
+ *   GCP_HOST          — e.g. "35.188.22.105"
+ *   AGENT_PORT        — e.g. "4001" (PM2 port for this agent on GCP)
+ *   GATEWAY_TOKEN     — Bearer token clients must send
+ *   ADMIN_TOKEN       — Bearer token for /admin routes
+ *   AGENT_ID          — e.g. "agent-001"
  */
 
 import { Hono } from 'hono'
-
-// ── Types ─────────────────────────────────────────────────────────────────────
+import { cors } from 'hono/cors'
 
 interface Env {
-  /** Cloudflare Container binding — the running OpenClaw sandbox */
-  CONTAINER: {
-    fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>
-  }
-  /** R2 bucket for workspace backups */
-  R2_BUCKET: R2Bucket
-  /** Unique agent identifier (e.g. "agent-001") */
-  AGENT_ID: string
-  /** Bearer token required to access /api/* and /ws routes */
+  GCP_HOST: string      // IP or hostname of GCP VM (no protocol, no trailing slash)
+  AGENT_PORT: string    // Port the OpenClaw gateway is running on for this agent
   GATEWAY_TOKEN: string
-  /** Admin token for management operations */
   ADMIN_TOKEN: string
+  AGENT_ID: string
 }
-
-// Container port (must match EXPOSE in Dockerfile and start-openclaw.sh)
-const CONTAINER_PORT = 18789
-
-// ── App ───────────────────────────────────────────────────────────────────────
 
 const app = new Hono<{ Bindings: Env }>()
 
-// ── Middleware: Auth ──────────────────────────────────────────────────────────
+app.use('*', cors())
 
-/**
- * Validates Bearer token on protected routes.
- * Returns 401 if missing or invalid.
- */
-function authMiddleware(env: Env, req: Request): Response | null {
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function getBackendBase(env: Env): string {
+  const host = env.GCP_HOST || '35.188.22.105'
+  const port = env.AGENT_PORT || '4001'
+  return `http://${host}:${port}`
+}
+
+function checkAuth(env: Env, req: Request): Response | null {
   const token = env.GATEWAY_TOKEN
-  if (!token) return null // No token configured — allow all (dev mode)
-
-  const authHeader = req.headers.get('Authorization') ?? ''
-  const [scheme, provided] = authHeader.split(' ')
+  if (!token) return null // dev mode — no auth configured
+  const auth = req.headers.get('Authorization') ?? ''
+  const [scheme, provided] = auth.split(' ')
   if (scheme !== 'Bearer' || provided !== token) {
-    return new Response(
-      JSON.stringify({ error: 'Unauthorized', hint: 'Provide Authorization: Bearer <GATEWAY_TOKEN>' }),
-      { status: 401, headers: { 'Content-Type': 'application/json' } }
+    return Response.json(
+      { error: 'Unauthorized', hint: 'Authorization: Bearer <GATEWAY_TOKEN>' },
+      { status: 401 }
     )
   }
   return null
 }
 
-// ── Routes ────────────────────────────────────────────────────────────────────
+// ── Health (no auth) ──────────────────────────────────────────────────────────
 
-/**
- * GET /health — quick liveness check (no auth required).
- * Returns agent metadata and container status.
- */
 app.get('/health', async (c) => {
-  let containerOk = false
+  const base = getBackendBase(c.env)
+  let backendOk = false
+  let backendMs = 0
   try {
-    const resp = await c.env.CONTAINER.fetch(`http://localhost:${CONTAINER_PORT}/api/health`)
-    containerOk = resp.status < 500
-  } catch {
-    containerOk = false
-  }
+    const t0 = Date.now()
+    const r = await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(3000) })
+    backendMs = Date.now() - t0
+    backendOk = r.status < 500
+  } catch { /* backend down */ }
 
   return c.json({
     status: 'ok',
-    agentId: c.env.AGENT_ID,
-    containerReachable: containerOk,
+    agentId: c.env.AGENT_ID || 'default',
+    backend: backendOk ? 'reachable' : 'unreachable',
+    backendMs,
+    backendUrl: `${base}/api/health`,
     ts: new Date().toISOString(),
   })
 })
 
-/**
- * ALL /api/* — authenticated proxy to the OpenClaw gateway HTTP API.
- *
- * The openclaw gateway exposes its own REST API on port 18789.
- * All paths under /api/ are forwarded verbatim.
- */
-app.all('/api/*', async (c) => {
-  const authErr = authMiddleware(c.env, c.req.raw)
-  if (authErr) return authErr
+// ── API proxy (authenticated) ─────────────────────────────────────────────────
 
-  // Build the target URL — replace host:port with container's localhost
-  const incomingUrl = new URL(c.req.url)
-  const targetUrl = new URL(incomingUrl.pathname + incomingUrl.search, `http://localhost:${CONTAINER_PORT}`)
+app.all('/api/*', async (c) => {
+  const err = checkAuth(c.env, c.req.raw)
+  if (err) return err
+
+  const base = getBackendBase(c.env)
+  const inUrl = new URL(c.req.url)
+  const target = `${base}${inUrl.pathname}${inUrl.search}`
 
   try {
-    const resp = await c.env.CONTAINER.fetch(targetUrl.toString(), {
+    const resp = await fetch(target, {
       method: c.req.method,
       headers: c.req.raw.headers,
       body: c.req.raw.body,
+      signal: AbortSignal.timeout(30000),
     })
-
     return new Response(resp.body, {
       status: resp.status,
       statusText: resp.statusText,
       headers: resp.headers,
     })
   } catch (err) {
-    console.error('[clawworker] Container fetch failed:', err)
-    return c.json(
-      { error: 'Container unavailable', detail: String(err), agentId: c.env.AGENT_ID },
-      503
-    )
+    return c.json({ error: 'Backend unavailable', detail: String(err) }, 503)
   }
 })
 
-/**
- * GET /ws — WebSocket upgrade relay to the OpenClaw container.
- *
- * The openclaw gateway supports WebSocket connections for real-time
- * chat and event streaming. This route upgrades and relays the WS to the
- * container's gateway endpoint.
- *
- * Auth: GATEWAY_TOKEN required (passed as ?token= query param or
- * Authorization header — openclaw gateway handles token validation
- * inside the container too).
- */
+// ── WebSocket relay (authenticated) ──────────────────────────────────────────
+
 app.get('/ws', async (c) => {
-  const upgradeHeader = c.req.header('Upgrade')
-  if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
+  const upgrade = c.req.header('Upgrade')
+  if (!upgrade || upgrade.toLowerCase() !== 'websocket') {
     return c.text('Expected WebSocket upgrade', 426)
   }
 
-  // Auth check — token can come from query param for WS clients that can't set headers
+  // Auth: token from query param or header (WS clients can't always set headers)
   const queryToken = new URL(c.req.url).searchParams.get('token') ?? ''
-  const authHeader = c.req.header('Authorization') ?? ''
-  const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : queryToken
-
-  const expectedToken = c.env.GATEWAY_TOKEN
-  if (expectedToken && bearerToken !== expectedToken) {
+  const headerToken = (c.req.header('Authorization') ?? '').replace('Bearer ', '')
+  const token = headerToken || queryToken
+  if (c.env.GATEWAY_TOKEN && token !== c.env.GATEWAY_TOKEN) {
     return c.text('Unauthorized', 401)
   }
 
-  // Forward the WebSocket upgrade to the container
-  try {
-    const targetUrl = `ws://localhost:${CONTAINER_PORT}/ws`
-    const wsReq = new Request(targetUrl, c.req.raw)
-    return c.env.CONTAINER.fetch(wsReq)
-  } catch (err) {
-    console.error('[clawworker] WebSocket relay failed:', err)
-    return c.text(`Container WebSocket unavailable: ${String(err)}`, 503)
-  }
+  const base = getBackendBase(c.env).replace('http://', 'ws://')
+  const { 0: client, 1: server } = new WebSocketPair()
+
+  server.accept()
+
+  // Connect to GCP backend WebSocket
+  const backendWs = new WebSocket(`${base}/ws`)
+
+  backendWs.addEventListener('message', (e) => server.send(e.data))
+  backendWs.addEventListener('close', () => server.close())
+  backendWs.addEventListener('error', () => server.close(1011, 'Backend error'))
+
+  server.addEventListener('message', (e) => {
+    if (backendWs.readyState === WebSocket.OPEN) backendWs.send(e.data)
+  })
+  server.addEventListener('close', () => backendWs.close())
+
+  return new Response(null, { status: 101, webSocket: client })
 })
 
-/**
- * GET /admin — Admin panel (protected by ADMIN_TOKEN).
- * Phase 1: basic status page.
- * Phase 2: provisioning API for multi-agent management.
- */
+// ── Admin ─────────────────────────────────────────────────────────────────────
+
 app.get('/admin', async (c) => {
   const adminToken = c.env.ADMIN_TOKEN
   if (adminToken) {
     const provided = (c.req.header('Authorization') ?? '').replace('Bearer ', '')
-    if (provided !== adminToken) {
-      return c.text('Forbidden', 403)
-    }
+    if (provided !== adminToken) return c.text('Forbidden', 403)
   }
-
   return c.json({
     worker: 'clawworker',
+    mode: 'gcp-proxy',
     agentId: c.env.AGENT_ID,
-    containerPort: CONTAINER_PORT,
-    uptime: Date.now(),
-    phase: 1,
+    backend: getBackendBase(c.env),
   })
 })
 
-// ── Cron: R2 Backup ───────────────────────────────────────────────────────────
-
-/**
- * Scheduled cron handler — runs every 5 minutes (configured in wrangler.toml).
- *
- * Strategy:
- *   1. Ask the container to tar its workspace (/root/clawd)
- *   2. Stream the response body into R2 as agent-{id}/workspace.tar.gz
- *   3. Log success/failure
- *
- * The restore flow (triggered by the Worker on first /api or /ws request after
- * a container restart) reverses this: download tar from R2, POST it to the
- * container's /restore endpoint.
- *
- * Note: Cloudflare Containers are ephemeral — the workspace is lost on restart
- * unless backed up. This cron is the persistence layer.
- */
-async function handleBackupCron(env: Env): Promise<void> {
-  const agentId = env.AGENT_ID || 'default'
-  const r2Key = `agents/${agentId}/workspace.tar.gz`
-
-  console.log(`[clawworker] Cron: backing up workspace for agent ${agentId}...`)
-
-  try {
-    // Ask the container to generate a tar of its workspace
-    const resp = await env.CONTAINER.fetch(
-      `http://localhost:${CONTAINER_PORT}/api/backup/export`,
-      { method: 'POST', headers: { Authorization: `Bearer ${env.GATEWAY_TOKEN}` } }
-    )
-
-    if (!resp.ok) {
-      console.warn(`[clawworker] Backup: container returned ${resp.status}`)
-      return
-    }
-
-    // Store in R2
-    await env.R2_BUCKET.put(r2Key, resp.body, {
-      httpMetadata: { contentType: 'application/gzip' },
-      customMetadata: { agentId, ts: new Date().toISOString() },
-    })
-
-    console.log(`[clawworker] Backup: saved ${r2Key}`)
-  } catch (err) {
-    console.error('[clawworker] Backup failed:', err)
-  }
-}
-
-// ── Default export ────────────────────────────────────────────────────────────
-
-export default {
-  fetch: app.fetch,
-
-  /**
-   * Scheduled handler — wired to cron triggers in wrangler.toml.
-   */
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(handleBackupCron(env))
-  },
-}
+export default { fetch: app.fetch }

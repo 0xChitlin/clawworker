@@ -1,30 +1,15 @@
 name = "clawworker"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
 
-# ── Container binding ─────────────────────────────────────────────────────────
-# Cloudflare Containers (beta): runs the Dockerfile in ./container/
-# as an isolated sandbox. The Worker proxies requests to it.
-# Docs: https://developers.cloudflare.com/containers/
-[[containers]]
-name = "CONTAINER"
-image = "./container"
-max_instances = 1
-
-# ── R2 bucket ─────────────────────────────────────────────────────────────────
-# Used for workspace backup/restore (5-minute cron).
-# Create bucket: wrangler r2 bucket create clawworker-backups
-[[r2_buckets]]
-binding = "R2_BUCKET"
-bucket_name = "clawworker-backups"
-
-# ── Public vars (non-secret) ──────────────────────────────────────────────────
-# Secrets (GATEWAY_TOKEN, ANTHROPIC_API_KEY, etc.) go in .dev.vars (local)
-# or `wrangler secret put <KEY>` (production).
+# ── Public vars ───────────────────────────────────────────────────────────────
+# Secrets go in .dev.vars (local) or `wrangler secret put <KEY>` (production)
 [vars]
 AGENT_ID = "default"
-MODEL = "anthropic/claude-sonnet-4-6"
+GCP_HOST = "35.188.22.105"
+AGENT_PORT = "80"
 
-# ── Cron: R2 backup every 5 minutes ──────────────────────────────────────────
-[[triggers.crons]]
-cron = "*/5 * * * *"
+# ── Secrets (set via: wrangler secret put GATEWAY_TOKEN) ─────────────────────
+# GATEWAY_TOKEN
+# ADMIN_TOKEN
