@@ -1,0 +1,13 @@
+node_modules/
+.wrangler/
+dist/
+*.js.map
+
+# Local secrets — NEVER commit
+.dev.vars
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db

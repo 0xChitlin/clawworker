@@ -1,0 +1,22 @@
+{
+  "name": "clawworker",
+  "version": "1.0.0",
+  "description": "OpenClaw agent hosting on Cloudflare Containers",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "container:build": "docker build -t clawworker-container ./container",
+    "container:run": "docker run --rm -p 18789:18789 --env-file .dev.vars clawworker-container",
+    "typecheck": "tsc --noEmit",
+    "secrets:push": "bash scripts/push-secrets.sh"
+  },
+  "dependencies": {
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.0.0",
+    "typescript": "^5.0.0",
+    "wrangler": "^3.0.0"
+  }
+}

@@ -1,0 +1,44 @@
+# .dev.vars.example — copy to .dev.vars and fill in your values
+# Used by `wrangler dev` for local development.
+# In production, use `wrangler secret put <KEY>` instead.
+#
+# NEVER commit .dev.vars to git (it's gitignored).
+
+# ── Required ──────────────────────────────────────────────────────────────────
+
+# Anthropic API key (for Claude models)
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Token required to access /api/* and /ws routes on the Worker
+# Generate: openssl rand -hex 32
+GATEWAY_TOKEN=your-secret-gateway-token
+
+# Admin panel token (for /admin route)
+ADMIN_TOKEN=your-secret-admin-token
+
+# ── Agent Identity ────────────────────────────────────────────────────────────
+
+# Unique ID for this agent instance (used for R2 backup paths)
+AGENT_ID=agent-001
+
+# Display name shown in chat interfaces
+AGENT_NAME=MyClawAgent
+
+# LLM model to use (default: anthropic/claude-sonnet-4-6)
+MODEL=anthropic/claude-sonnet-4-6
+
+# ── Optional: Telegram channel ────────────────────────────────────────────────
+
+# Telegram bot token (from @BotFather)
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
+
+# Default Telegram chat ID to respond in (optional)
+TELEGRAM_CHAT_ID=123456789
+
+# ── Optional: Additional LLM providers ───────────────────────────────────────
+
+OPENAI_API_KEY=sk-...
+
+# ── Optional: Web search ──────────────────────────────────────────────────────
+
+BRAVE_API_KEY=BSA...
