@@ -2,6 +2,7 @@ name = "clawworker"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
 compatibility_flags = ["nodejs_compat"]
+account_id = "6ab763c3afab27d4c4cef608d1955aa7"
 
 # ── Public vars ───────────────────────────────────────────────────────────────
 # Secrets go in .dev.vars (local) or `wrangler secret put <KEY>` (production)
