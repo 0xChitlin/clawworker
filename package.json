@@ -12,6 +12,7 @@
     "secrets:push": "bash scripts/push-secrets.sh"
   },
   "dependencies": {
+    "@noble/hashes": "^2.0.1",
     "hono": "^4.0.0"
   },
   "devDependencies": {
